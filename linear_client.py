@@ -1,10 +1,13 @@
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, List
 from dotenv import load_dotenv
 import requests
 import json
-from database import init_db, User, Cycle, Issue, CycleCapacity, CycleMetrics, UserMetrics
+from database import (
+    init_db, User, Cycle, Issue, CycleCapacity, CycleMetrics, UserMetrics,
+    BlockedPeriod, IssueStateChange, DailyMetrics
+)
 from sqlalchemy.orm import Session
 import pandas as pd
 
@@ -54,7 +57,6 @@ class LinearMetricsClient:
                 headers=self.headers,
                 json={'query': query, 'variables': variables or {}}
             )
-            print(f"Query response: {response.text}")  # Debug output
             response.raise_for_status()
             return response.json()
         except requests.exceptions.HTTPError as e:
@@ -69,6 +71,7 @@ class LinearMetricsClient:
         self.sync_users()
         self.sync_cycles()
         self.sync_issues()
+        self.sync_daily_metrics()
         self.calculate_metrics()
 
     def sync_users(self):
@@ -98,7 +101,6 @@ class LinearMetricsClient:
 
     def sync_cycles(self):
         """Fetch and store cycles (sprints)"""
-        # First get teams and their cycles
         teams_query = """
         query {
             teams(first: 50) {
@@ -111,6 +113,10 @@ class LinearMetricsClient:
                             name
                             startsAt
                             endsAt
+                            scopeTarget
+                            progress {
+                                scopeProgress
+                            }
                         }
                     }
                 }
@@ -120,7 +126,6 @@ class LinearMetricsClient:
         teams_result = self._execute_query(teams_query)
         teams = teams_result['data']['teams']['nodes']
         
-        # Store cycles first
         for team in teams:
             cycles = team['cycles']['nodes']
             for cycle_data in cycles:
@@ -129,12 +134,14 @@ class LinearMetricsClient:
                     number=cycle_data['number'],
                     name=cycle_data['name'],
                     start_date=datetime.fromisoformat(cycle_data['startsAt'].replace('Z', '+00:00')),
-                    end_date=datetime.fromisoformat(cycle_data['endsAt'].replace('Z', '+00:00'))
+                    end_date=datetime.fromisoformat(cycle_data['endsAt'].replace('Z', '+00:00')),
+                    target_story_points=cycle_data['scopeTarget'],
+                    max_wip=5  # Default WIP limit, adjust as needed
                 )
                 self.db.merge(db_cycle)
         self.db.commit()
 
-        # Then get memberships for each team
+        # Then get memberships and set capacities
         for team in teams:
             members_query = """
             query($teamId: String!) {
@@ -152,21 +159,20 @@ class LinearMetricsClient:
             members_result = self._execute_query(members_query, {'teamId': team['id']})
             members = members_result['data']['team']['memberships']['nodes']
             
-            # Store cycle capacities for each member
             cycles = team['cycles']['nodes']
             for cycle_data in cycles:
                 for member in members:
                     capacity = CycleCapacity(
                         cycle_id=cycle_data['id'],
                         user_id=member['user']['id'],
-                        capacity=40.0  # Default to 40 hours/week, adjust as needed
+                        capacity_hours=32.0,  # Default to 32 productive hours/week (80% of 40)
+                        capacity_points=10.0  # Default story point capacity
                     )
                     self.db.merge(capacity)
             self.db.commit()
 
     def sync_issues(self):
-        """Fetch and store issues (tickets)"""
-        # Get teams first
+        """Fetch and store issues with detailed history"""
         teams_query = """
         query {
             teams(first: 50) {
@@ -179,28 +185,48 @@ class LinearMetricsClient:
         teams_result = self._execute_query(teams_query)
         teams = teams_result['data']['teams']['nodes']
         
-        # Then get issues for each team
         for team in teams:
             issues_query = """
             query($teamId: String!) {
                 team(id: $teamId) {
-                    issues(first: 50) {
+                    issues(first: 100) {
                         nodes {
                             id
                             title
                             description
                             state {
                                 name
+                                type
                             }
                             priority
                             estimate
                             createdAt
+                            startedAt
                             completedAt
                             cycle {
                                 id
                             }
                             assignee {
                                 id
+                            }
+                            history {
+                                nodes {
+                                    createdAt
+                                    fromState {
+                                        name
+                                        type
+                                    }
+                                    toState {
+                                        name
+                                        type
+                                    }
+                                }
+                            }
+                            customFields {
+                                nodes {
+                                    name
+                                    value
+                                }
                             }
                         }
                     }
@@ -211,6 +237,15 @@ class LinearMetricsClient:
             issues = issues_result['data']['team']['issues']['nodes']
             
             for issue_data in issues:
+                # Get ideal hours from custom fields if available
+                ideal_hours = None
+                actual_hours = None
+                for field in issue_data['customFields']['nodes']:
+                    if field['name'] == 'Ideal Hours':
+                        ideal_hours = float(field['value'])
+                    elif field['name'] == 'Actual Hours':
+                        actual_hours = float(field['value'])
+
                 db_issue = Issue(
                     id=issue_data['id'],
                     title=issue_data['title'],
@@ -218,13 +253,88 @@ class LinearMetricsClient:
                     state=issue_data['state']['name'],
                     priority=issue_data['priority'],
                     estimate=issue_data['estimate'],
+                    ideal_hours=ideal_hours,
+                    actual_hours=actual_hours,
                     created_at=datetime.fromisoformat(issue_data['createdAt'].replace('Z', '+00:00')),
+                    started_at=datetime.fromisoformat(issue_data['startedAt'].replace('Z', '+00:00')) if issue_data['startedAt'] else None,
                     completed_at=datetime.fromisoformat(issue_data['completedAt'].replace('Z', '+00:00')) if issue_data['completedAt'] else None,
                     cycle_id=issue_data['cycle']['id'] if issue_data['cycle'] else None,
                     assignee_id=issue_data['assignee']['id'] if issue_data['assignee'] else None
                 )
                 self.db.merge(db_issue)
+
+                # Store state changes
+                for history in issue_data['history']['nodes']:
+                    if history['fromState'] and history['toState']:
+                        state_change = IssueStateChange(
+                            issue_id=issue_data['id'],
+                            from_state=history['fromState']['name'],
+                            to_state=history['toState']['name'],
+                            changed_at=datetime.fromisoformat(history['createdAt'].replace('Z', '+00:00'))
+                        )
+                        self.db.merge(state_change)
+
+                        # Track blocked periods
+                        if history['toState']['type'] == 'blocked':
+                            blocked_period = BlockedPeriod(
+                                issue_id=issue_data['id'],
+                                start_time=datetime.fromisoformat(history['createdAt'].replace('Z', '+00:00')),
+                                reason='External Dependency',  # Default reason
+                                description=f"Blocked in state: {history['toState']['name']}"
+                            )
+                            self.db.merge(blocked_period)
+                        elif history['fromState']['type'] == 'blocked' and history['toState']['type'] != 'blocked':
+                            # Find and update the open blocked period
+                            blocked_period = self.db.query(BlockedPeriod).filter(
+                                BlockedPeriod.issue_id == issue_data['id'],
+                                BlockedPeriod.end_time.is_(None)
+                            ).first()
+                            if blocked_period:
+                                blocked_period.end_time = datetime.fromisoformat(history['createdAt'].replace('Z', '+00:00'))
+
             self.db.commit()
+
+    def sync_daily_metrics(self):
+        """Calculate and store daily metrics for active cycles"""
+        cycles = self.db.query(Cycle).all()
+        
+        for cycle in cycles:
+            current_date = cycle.start_date
+            while current_date <= min(cycle.end_date, datetime.now()):
+                # Calculate metrics for this day
+                issues = cycle.issues
+                
+                # WIP count - issues in progress on this day
+                wip_count = len([i for i in issues if 
+                    i.started_at and i.started_at <= current_date and 
+                    (not i.completed_at or i.completed_at > current_date)])
+                
+                # Blocked items count
+                blocked_count = len([i for i in issues if any(
+                    b.start_time <= current_date and (not b.end_time or b.end_time > current_date)
+                    for b in i.blocked_periods)])
+                
+                # Completed points up to this day
+                completed_points = sum(i.estimate or 0 for i in issues if 
+                    i.completed_at and i.completed_at.date() <= current_date.date())
+                
+                # Remaining hours
+                remaining_hours = sum(i.ideal_hours or 0 for i in issues if 
+                    not i.completed_at or i.completed_at > current_date)
+                
+                daily_metrics = DailyMetrics(
+                    cycle_id=cycle.id,
+                    date=current_date,
+                    remaining_hours=remaining_hours,
+                    completed_points=completed_points,
+                    wip_count=wip_count,
+                    blocked_items=blocked_count
+                )
+                self.db.merge(daily_metrics)
+                
+                current_date += timedelta(days=1)
+        
+        self.db.commit()
 
     def calculate_metrics(self):
         """Calculate and store metrics for cycles and users"""
@@ -232,7 +342,7 @@ class LinearMetricsClient:
         self._calculate_user_metrics()
 
     def _calculate_cycle_metrics(self):
-        """Calculate metrics for each cycle"""
+        """Calculate comprehensive metrics for each cycle"""
         cycles = self.db.query(Cycle).all()
         for cycle in cycles:
             issues = cycle.issues
@@ -241,20 +351,33 @@ class LinearMetricsClient:
             total_points = sum(i.estimate or 0 for i in issues)
             completed_points = sum(i.estimate or 0 for i in completed_issues)
             
-            if completed_issues:
-                completion_times = [(i.completed_at - i.created_at).total_seconds() / 3600 
-                                  for i in completed_issues]
-                avg_completion_time = sum(completion_times) / len(completion_times)
-            else:
-                avg_completion_time = 0
+            # Calculate average cycle and lead times
+            cycle_times = []
+            lead_times = []
+            blocked_times = []
+            
+            for issue in completed_issues:
+                if issue.started_at and issue.completed_at:
+                    cycle_times.append((issue.completed_at - issue.started_at).total_seconds() / 3600)
+                if issue.created_at and issue.completed_at:
+                    lead_times.append((issue.completed_at - issue.created_at).total_seconds() / 3600)
+                
+                # Calculate total blocked time
+                blocked_time = sum(
+                    ((b.end_time or datetime.now()) - b.start_time).total_seconds() / 3600
+                    for b in issue.blocked_periods
+                )
+                blocked_times.append(blocked_time)
             
             metrics = CycleMetrics(
                 cycle_id=cycle.id,
                 total_story_points=total_points,
                 completed_story_points=completed_points,
-                avg_completion_time=avg_completion_time,
+                avg_cycle_time=sum(cycle_times) / len(cycle_times) if cycle_times else 0,
+                avg_lead_time=sum(lead_times) / len(lead_times) if lead_times else 0,
                 throughput=len(completed_issues),
                 velocity=completed_points,
+                avg_blocked_time=sum(blocked_times) / len(blocked_times) if blocked_times else 0,
                 start_date=cycle.start_date,
                 end_date=cycle.end_date
             )
@@ -262,7 +385,7 @@ class LinearMetricsClient:
         self.db.commit()
 
     def _calculate_user_metrics(self):
-        """Calculate metrics for each user in each cycle"""
+        """Calculate comprehensive metrics for each user"""
         users = self.db.query(User).all()
         cycles = self.db.query(Cycle).all()
         
@@ -275,22 +398,30 @@ class LinearMetricsClient:
                     continue
                 
                 points_completed = sum(i.estimate or 0 for i in completed_issues)
-                completion_times = [(i.completed_at - i.created_at).total_seconds() / 3600 
-                                  for i in completed_issues]
-                avg_completion_time = sum(completion_times) / len(completion_times)
+                cycle_times = []
+                
+                for issue in completed_issues:
+                    if issue.started_at and issue.completed_at:
+                        cycle_times.append((issue.completed_at - issue.started_at).total_seconds() / 3600)
+                
+                # Calculate efficiency ratio (ideal vs actual hours)
+                total_ideal = sum(i.ideal_hours or 0 for i in completed_issues)
+                total_actual = sum(i.actual_hours or 0 for i in completed_issues)
+                efficiency_ratio = total_ideal / total_actual if total_actual else 1.0
                 
                 # Get user capacity for this cycle
-                capacity = next((c.capacity for c in cycle.capacities if c.user_id == user.id), 40.0)
-                
-                metrics = UserMetrics(
-                    user_id=user.id,
-                    cycle_id=cycle.id,
-                    story_points_completed=points_completed,
-                    avg_completion_time=avg_completion_time,
-                    velocity=points_completed,
-                    capacity_utilization=points_completed / capacity if capacity else 0
-                )
-                self.db.merge(metrics)
+                capacity = next((c for c in cycle.capacities if c.user_id == user.id), None)
+                if capacity:
+                    metrics = UserMetrics(
+                        user_id=user.id,
+                        cycle_id=cycle.id,
+                        story_points_completed=points_completed,
+                        avg_cycle_time=sum(cycle_times) / len(cycle_times) if cycle_times else 0,
+                        velocity=points_completed,
+                        capacity_utilization=points_completed / capacity.capacity_points if capacity.capacity_points else 0,
+                        efficiency_ratio=efficiency_ratio
+                    )
+                    self.db.merge(metrics)
         self.db.commit()
 
     def get_cycle_metrics_df(self) -> pd.DataFrame:
@@ -300,9 +431,11 @@ class LinearMetricsClient:
             'cycle_id': m.cycle_id,
             'total_story_points': m.total_story_points,
             'completed_story_points': m.completed_story_points,
-            'avg_completion_time': m.avg_completion_time,
+            'avg_cycle_time': m.avg_cycle_time,
+            'avg_lead_time': m.avg_lead_time,
             'throughput': m.throughput,
             'velocity': m.velocity,
+            'avg_blocked_time': m.avg_blocked_time,
             'start_date': m.start_date,
             'end_date': m.end_date
         } for m in metrics])
@@ -314,7 +447,20 @@ class LinearMetricsClient:
             'user_id': m.user_id,
             'cycle_id': m.cycle_id,
             'story_points_completed': m.story_points_completed,
-            'avg_completion_time': m.avg_completion_time,
+            'avg_cycle_time': m.avg_cycle_time,
             'velocity': m.velocity,
-            'capacity_utilization': m.capacity_utilization
+            'capacity_utilization': m.capacity_utilization,
+            'efficiency_ratio': m.efficiency_ratio
+        } for m in metrics])
+
+    def get_daily_metrics_df(self) -> pd.DataFrame:
+        """Return daily metrics as a pandas DataFrame"""
+        metrics = self.db.query(DailyMetrics).all()
+        return pd.DataFrame([{
+            'cycle_id': m.cycle_id,
+            'date': m.date,
+            'remaining_hours': m.remaining_hours,
+            'completed_points': m.completed_points,
+            'wip_count': m.wip_count,
+            'blocked_items': m.blocked_items
         } for m in metrics])
