@@ -22,7 +22,31 @@ A comprehensive analytics and forecasting dashboard for Linear.app that provides
 - Linear.app API key
 - Required Python packages (see requirements.txt)
 
-## Installation
+## Installation & Usage
+
+### Using Docker (Recommended)
+
+1. Clone the repository
+2. Create a `.env` file with your Linear API key:
+```
+LINEAR_KEY=your_api_key_here
+```
+
+3. Create a data directory for persistent storage:
+```bash
+mkdir data
+```
+
+4. Build and start the container:
+```bash
+docker-compose up -d
+```
+
+5. Access the dashboard at http://localhost:8501
+
+The container will automatically sync data from Linear and keep the dashboard running.
+
+### Manual Installation (Development)
 
 1. Clone the repository
 2. Create a virtual environment:
@@ -38,17 +62,37 @@ pip3 install -r requirements.txt
 
 4. Create a `.env` file with your Linear API key:
 ```
-linear_key=your_api_key_here
+LINEAR_KEY=your_api_key_here
 ```
 
-## Usage
-
-1. Run the main script to sync data and launch the dashboard:
+5. Run the main script to sync data and launch the dashboard:
 ```bash
 python3 main.py
 ```
 
-2. Access the dashboard at http://localhost:8501
+6. Access the dashboard at http://localhost:8501
+
+## Docker Commands
+
+- Start the container:
+```bash
+docker-compose up -d
+```
+
+- View logs:
+```bash
+docker-compose logs -f
+```
+
+- Stop the container:
+```bash
+docker-compose down
+```
+
+- Rebuild and restart:
+```bash
+docker-compose up -d --build
+```
 
 ## Dashboard Features
 

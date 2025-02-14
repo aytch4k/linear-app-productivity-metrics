@@ -62,10 +62,16 @@ def get_filtered_data(start_date, end_date):
     return filtered_cycle_metrics, filtered_user_metrics, filtered_daily_metrics
 
 # Get filtered data
-cycle_metrics, user_metrics, daily_metrics = get_filtered_data(
-    date_range[0],
-    date_range[1]
-)
+try:
+    cycle_metrics, user_metrics, daily_metrics = get_filtered_data(
+        date_range[0],
+        date_range[1]
+    )
+except KeyError:
+    st.warning("Some metrics are not available yet. Only user data has been synced.")
+    cycle_metrics = pd.DataFrame()
+    user_metrics = linear_client.get_user_metrics_df()
+    daily_metrics = pd.DataFrame()
 
 # Main dashboard
 st.title("Linear.app Analytics Dashboard")

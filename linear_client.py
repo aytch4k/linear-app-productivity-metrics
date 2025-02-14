@@ -14,13 +14,16 @@ import pandas as pd
 class LinearMetricsClient:
     def __init__(self):
         load_dotenv()
-        self.api_key = os.getenv('linear_key')
+        self.api_key = os.getenv('LINEAR_KEY')  # Match the case with docker-compose.yml
+        print(f"Loaded API key: {self.api_key}")  # Debug print
         self.headers = {
             'Authorization': self.api_key,
             'Content-Type': 'application/json',
         }
         self.api_url = 'https://api.linear.app/graphql'
-        self.db = init_db(force_recreate=True)
+        print("Initializing database...")
+        self.db = init_db(force_recreate=False)  # Don't recreate DB on every run
+        print("Database initialized")
 
     def test_connection(self):
         """Test the API connection with a simple viewer query"""
@@ -68,11 +71,16 @@ class LinearMetricsClient:
         if not self.test_connection():
             raise Exception("Failed to connect to Linear API")
         
-        self.sync_users()
-        self.sync_cycles()
-        self.sync_issues()
-        self.sync_daily_metrics()
-        self.calculate_metrics()
+        print("Syncing data from Linear...")
+        try:
+            self.sync_users()
+            self.sync_cycles()
+            self.sync_issues()
+            self.sync_daily_metrics()
+            self.calculate_metrics()
+        except Exception as e:
+            print(f"Error syncing data: {str(e)}")
+            raise
 
     def sync_users(self):
         """Fetch and store team members"""
@@ -106,11 +114,19 @@ class LinearMetricsClient:
             teams(first: 10) {
                 nodes {
                     id
-                    cycles(
-                        first: 10,
-                        last: 5,
-                        orderBy: { startsAt: DESC }
-                    ) {
+                    name
+                }
+            }
+        }
+        """
+        teams_result = self._execute_query(teams_query)
+        teams = teams_result['data']['teams']['nodes']
+        
+        for team in teams:
+            cycles_query = """
+            query($teamId: String!) {
+                team(id: $teamId) {
+                    cycles(first: 10) {
                         nodes {
                             id
                             number
@@ -122,207 +138,181 @@ class LinearMetricsClient:
                     }
                 }
             }
-        }
-        """
-        teams_result = self._execute_query(teams_query)
-        teams = teams_result['data']['teams']['nodes']
-        
-        for team in teams:
-            cycles = team['cycles']['nodes']
-            for cycle_data in cycles:
-                db_cycle = Cycle(
-                    id=cycle_data['id'],
-                    number=cycle_data['number'],
-                    name=cycle_data['name'],
-                    start_date=datetime.fromisoformat(cycle_data['startsAt'].replace('Z', '+00:00')),
-                    end_date=datetime.fromisoformat(cycle_data['endsAt'].replace('Z', '+00:00')),
-                    progress=cycle_data['progress'],
-                    max_wip=5  # Default WIP limit, adjust as needed
-                )
-                self.db.merge(db_cycle)
-        self.db.commit()
+            """
+            try:
+                cycles_result = self._execute_query(cycles_query, {'teamId': team['id']})
+                cycles = cycles_result['data']['team']['cycles']['nodes']
+                print(f"Found {len(cycles)} cycles for team {team['id']}")
+                
+                # First pass: Create all cycles
+                for cycle_data in cycles:
+                    db_cycle = Cycle(
+                        id=cycle_data['id'],
+                        number=cycle_data['number'],
+                        name=cycle_data['name'],
+                        start_date=datetime.fromisoformat(cycle_data['startsAt'].replace('Z', '+00:00')),
+                        end_date=datetime.fromisoformat(cycle_data['endsAt'].replace('Z', '+00:00')),
+                        progress=cycle_data['progress'],
+                        max_wip=5,  # Default WIP limit, adjust as needed
+                        team_id=team['id'],
+                        team_name=team['name']
+                    )
+                    self.db.merge(db_cycle)
+                
+                # Commit cycles for this team before moving to the next
+                self.db.commit()
+                print(f"Saved cycles for team {team['name']}")
+                
+                # Verify cycles were saved
+                saved_cycles = self.db.query(Cycle).filter(Cycle.team_id == team['id']).all()
+                print(f"Verified {len(saved_cycles)} cycles saved for team {team['name']}")
+            except Exception as e:
+                print(f"Error processing cycles for team {team['id']}: {str(e)}")
+                continue
 
-        # Then get memberships and set capacities
+        # Set default capacities for team members
         for team in teams:
-            members_query = """
-            query($teamId: String!) {
-                team(id: $teamId) {
-                    memberships(first: 50) {
-                        nodes {
-                            user {
-                                id
+            try:
+                members_query = """
+                query($teamId: String!) {
+                    team(id: $teamId) {
+                        memberships(first: 50) {
+                            nodes {
+                                user {
+                                    id
+                                }
                             }
                         }
                     }
                 }
-            }
-            """
-            members_result = self._execute_query(members_query, {'teamId': team['id']})
-            members = members_result['data']['team']['memberships']['nodes']
-            
-            cycles = team['cycles']['nodes']
-            for cycle_data in cycles:
-                for member in members:
-                    capacity = CycleCapacity(
-                        cycle_id=cycle_data['id'],
-                        user_id=member['user']['id'],
-                        capacity_hours=32.0,  # Default to 32 productive hours/week (80% of 40)
-                        capacity_points=10.0  # Default story point capacity
-                    )
-                    self.db.merge(capacity)
-            self.db.commit()
+                """
+                members_result = self._execute_query(members_query, {'teamId': team['id']})
+                members = members_result['data']['team']['memberships']['nodes']
+                print(f"Found {len(members)} members for team {team['name']}")
+                
+                # Get cycles for this team from the database
+                cycles = self.db.query(Cycle).filter(Cycle.team_id == team['id']).all()
+                print(f"Setting capacities for {len(cycles)} cycles in team {team['name']}")
+                
+                for cycle in cycles:
+                    for member in members:
+                        try:
+                            capacity = CycleCapacity(
+                                cycle_id=cycle.id,
+                                user_id=member['user']['id'],
+                                capacity_hours=32.0,  # Default to 32 productive hours/week (80% of 40)
+                                capacity_points=10.0  # Default story point capacity
+                            )
+                            self.db.merge(capacity)
+                        except Exception as e:
+                            print(f"Error setting capacity for user {member['user']['id']} in cycle {cycle.id}: {str(e)}")
+                            continue
+                    self.db.commit()
+                print(f"Finished setting capacities for team {team['name']}")
+            except Exception as e:
+                print(f"Error processing team {team['id']}: {str(e)}")
+                continue
 
     def sync_issues(self):
         """Fetch and store issues with detailed history"""
-        teams_query = """
-        query {
-            teams(first: 50) {
-                nodes {
-                    id
-                }
-            }
-        }
-        """
-        teams_result = self._execute_query(teams_query)
-        teams = teams_result['data']['teams']['nodes']
-        
-        for team in teams:
-            issues_query = """
-            query($teamId: String!, $after: String) {
-                team(id: $teamId) {
-                    issues(
-                        first: 50,
-                        after: $after,
-                        filter: {
-                            createdAt: { gte: "2024-01-01" }
-                        }
-                    ) {
-                        nodes {
-                            id
-                            title
-                            description
-                            state {
-                                name
-                                type
-                            }
-                            priority
-                            estimate
-                            createdAt
-                            startedAt
-                            completedAt
-                            cycle {
-                                id
-                            }
-                            assignee {
-                                id
-                            }
-                            team {
-                                id
-                                name
-                            }
-                            project {
-                                id
-                                name
-                            }
-                            labels {
-                                nodes {
-                                    name
-                                }
-                            }
-                            history(first: 50) {
-                                nodes {
-                                    createdAt
-                                    fromState {
-                                        name
-                                        type
-                                    }
-                                    toState {
-                                        name
-                                        type
-                                    }
-                                }
-                            }
-                        }
-                        pageInfo {
-                            hasNextPage
-                            endCursor
-                        }
+        try:
+            teams_query = """
+            query {
+                teams(first: 50) {
+                    nodes {
+                        id
+                        name
                     }
                 }
             }
             """
-            after = None
-            while True:
-                issues_result = self._execute_query(issues_query, {'teamId': team['id'], 'after': after})
-                issues = issues_result['data']['team']['issues']['nodes']
-                page_info = issues_result['data']['team']['issues']['pageInfo']
-                
-                for issue_data in issues:
-                    # Extract initiative from labels (assuming initiative labels start with "Initiative:")
-                    initiative = None
-                    if 'labels' in issue_data and issue_data['labels']['nodes']:
-                        for label in issue_data['labels']['nodes']:
-                            if label['name'].startswith('Initiative:'):
-                                initiative = label['name'].replace('Initiative:', '').strip()
-                                break
-
-                    db_issue = Issue(
-                        id=issue_data['id'],
-                        title=issue_data['title'],
-                        description=issue_data['description'],
-                        state=issue_data['state']['name'],
-                        priority=issue_data['priority'],
-                        estimate=issue_data['estimate'],
-                        ideal_hours=0.0,  # Default since customFields are not available
-                        actual_hours=0.0,  # Default since customFields are not available
-                        created_at=datetime.fromisoformat(issue_data['createdAt'].replace('Z', '+00:00')),
-                        started_at=datetime.fromisoformat(issue_data['startedAt'].replace('Z', '+00:00')) if issue_data['startedAt'] else None,
-                        completed_at=datetime.fromisoformat(issue_data['completedAt'].replace('Z', '+00:00')) if issue_data['completedAt'] else None,
-                        cycle_id=issue_data['cycle']['id'] if issue_data['cycle'] else None,
-                        assignee_id=issue_data['assignee']['id'] if issue_data['assignee'] else None,
-                        team_id=issue_data['team']['id'] if issue_data['team'] else None,
-                        team_name=issue_data['team']['name'] if issue_data['team'] else None,
-                        project_id=issue_data['project']['id'] if issue_data['project'] else None,
-                        project_name=issue_data['project']['name'] if issue_data['project'] else None,
-                        initiative=initiative
-                    )
-                    self.db.merge(db_issue)
-
-                    # Store state changes
-                    for history in issue_data['history']['nodes']:
-                        if history['fromState'] and history['toState']:
-                            state_change = IssueStateChange(
-                                issue_id=issue_data['id'],
-                                from_state=history['fromState']['name'],
-                                to_state=history['toState']['name'],
-                                changed_at=datetime.fromisoformat(history['createdAt'].replace('Z', '+00:00'))
-                            )
-                            self.db.merge(state_change)
-
-                            # Track blocked periods
-                            if history['toState']['type'] == 'blocked':
-                                blocked_period = BlockedPeriod(
-                                    issue_id=issue_data['id'],
-                                    start_time=datetime.fromisoformat(history['createdAt'].replace('Z', '+00:00')),
-                                    reason='External Dependency',  # Default reason
-                                    description=f"Blocked in state: {history['toState']['name']}"
-                                )
-                                self.db.merge(blocked_period)
-                            elif history['fromState']['type'] == 'blocked' and history['toState']['type'] != 'blocked':
-                                # Find and update the open blocked period
-                                blocked_period = self.db.query(BlockedPeriod).filter(
-                                    BlockedPeriod.issue_id == issue_data['id'],
-                                    BlockedPeriod.end_time.is_(None)
-                                ).first()
-                                if blocked_period:
-                                    blocked_period.end_time = datetime.fromisoformat(history['createdAt'].replace('Z', '+00:00'))
-
-                self.db.commit()
-                
-                if not page_info['hasNextPage']:
-                    break
+            teams_result = self._execute_query(teams_query)
+            teams = teams_result['data']['teams']['nodes']
+            
+            for team in teams:
+                issues_query = """
+                query($teamId: String!, $after: String) {
+                    team(id: $teamId) {
+                        issues(
+                            first: 20,
+                            after: $after,
+                            filter: {
+                                createdAt: { gte: "2024-01-01" }
+                            }
+                        ) {
+                            nodes {
+                                id
+                                title
+                                state {
+                                    name
+                                    type
+                                }
+                                priority
+                                estimate
+                                createdAt
+                                startedAt
+                                completedAt
+                                cycle {
+                                    id
+                                }
+                                assignee {
+                                    id
+                                }
+                            }
+                            pageInfo {
+                                hasNextPage
+                                endCursor
+                            }
+                        }
+                    }
+                }
+                """
+                after = None
+                while True:
+                    issues_result = self._execute_query(issues_query, {'teamId': team['id'], 'after': after})
+                    issues = issues_result['data']['team']['issues']['nodes']
+                    page_info = issues_result['data']['team']['issues']['pageInfo']
                     
-                after = page_info['endCursor']
+                    for issue_data in issues:
+                        # Check if cycle exists before creating issue
+                        cycle_id = issue_data['cycle']['id'] if issue_data['cycle'] else None
+                        if cycle_id:
+                            cycle = self.db.query(Cycle).filter(Cycle.id == cycle_id).first()
+                            if not cycle:
+                                print(f"Skipping issue {issue_data['id']} - cycle {cycle_id} not found")
+                                continue
+
+                        db_issue = Issue(
+                            id=issue_data['id'],
+                            title=issue_data['title'],
+                            description='',  # We'll fetch this separately if needed
+                            state=issue_data['state']['name'],
+                            priority=issue_data['priority'],
+                            estimate=issue_data['estimate'],
+                            ideal_hours=0.0,
+                            actual_hours=0.0,
+                            created_at=datetime.fromisoformat(issue_data['createdAt'].replace('Z', '+00:00')),
+                            started_at=datetime.fromisoformat(issue_data['startedAt'].replace('Z', '+00:00')) if issue_data['startedAt'] else None,
+                            completed_at=datetime.fromisoformat(issue_data['completedAt'].replace('Z', '+00:00')) if issue_data['completedAt'] else None,
+                            cycle_id=cycle_id,
+                            assignee_id=issue_data['assignee']['id'] if issue_data['assignee'] else None,
+                            team_id=team['id'],
+                            team_name=team['name'],
+                            project_id=None,  # We'll fetch this separately if needed
+                            project_name=None,
+                            initiative=None  # We'll fetch this separately if needed
+                        )
+                        self.db.merge(db_issue)
+                    
+                    self.db.commit()
+                    
+                    if not page_info['hasNextPage']:
+                        break
+                        
+                    after = page_info['endCursor']
+        except Exception as e:
+            print(f"Error syncing issues: {str(e)}")
+            raise
 
     def sync_daily_metrics(self):
         """Calculate and store daily metrics for active cycles"""
@@ -373,111 +363,91 @@ class LinearMetricsClient:
 
     def _calculate_cycle_metrics(self):
         """Calculate comprehensive metrics for each cycle"""
-        cycles = self.db.query(Cycle).all()
-        for cycle in cycles:
-            issues = cycle.issues
-            completed_issues = [i for i in issues if i.completed_at]
-            
-            total_points = sum(i.estimate or 0 for i in issues)
-            completed_points = sum(i.estimate or 0 for i in completed_issues)
-            
-            # Calculate average cycle and lead times
-            cycle_times = []
-            lead_times = []
-            blocked_times = []
-            
-            for issue in completed_issues:
-                if issue.started_at and issue.completed_at:
-                    cycle_times.append((issue.completed_at - issue.started_at).total_seconds() / 3600)
-                if issue.created_at and issue.completed_at:
-                    lead_times.append((issue.completed_at - issue.created_at).total_seconds() / 3600)
-                
-                # Calculate total blocked time
-                blocked_time = sum(
-                    ((b.end_time or datetime.now()) - b.start_time).total_seconds() / 3600
-                    for b in issue.blocked_periods
-                )
-                blocked_times.append(blocked_time)
-            
-            # Get most common team/project/initiative info from issues
-            team_counts = {}
-            project_counts = {}
-            initiative_counts = {}
-            
-            for issue in issues:
-                if issue.team_name:
-                    team_counts[issue.team_name] = team_counts.get(issue.team_name, 0) + 1
-                if issue.project_name:
-                    project_counts[issue.project_name] = project_counts.get(issue.project_name, 0) + 1
-                if issue.initiative:
-                    initiative_counts[issue.initiative] = initiative_counts.get(issue.initiative, 0) + 1
-            
-            # Get most common values
-            team_name = max(team_counts.items(), key=lambda x: x[1])[0] if team_counts else None
-            team_id = next((i.team_id for i in issues if i.team_name == team_name), None)
-            project_name = max(project_counts.items(), key=lambda x: x[1])[0] if project_counts else None
-            project_id = next((i.project_id for i in issues if i.project_name == project_name), None)
-            initiative = max(initiative_counts.items(), key=lambda x: x[1])[0] if initiative_counts else None
-            
-            metrics = CycleMetrics(
-                cycle_id=cycle.id,
-                total_story_points=total_points,
-                completed_story_points=completed_points,
-                avg_cycle_time=sum(cycle_times) / len(cycle_times) if cycle_times else 0,
-                avg_lead_time=sum(lead_times) / len(lead_times) if lead_times else 0,
-                throughput=len(completed_issues),
-                velocity=completed_points,
-                avg_blocked_time=sum(blocked_times) / len(blocked_times) if blocked_times else 0,
-                start_date=cycle.start_date,
-                end_date=cycle.end_date,
-                team_id=team_id,
-                team_name=team_name,
-                project_id=project_id,
-                project_name=project_name,
-                initiative=initiative
-            )
-            self.db.merge(metrics)
-        self.db.commit()
-
-    def _calculate_user_metrics(self):
-        """Calculate comprehensive metrics for each user"""
-        users = self.db.query(User).all()
-        cycles = self.db.query(Cycle).all()
-        
-        for user in users:
+        try:
+            cycles = self.db.query(Cycle).all()
             for cycle in cycles:
-                user_issues = [i for i in cycle.issues if i.assignee_id == user.id]
-                completed_issues = [i for i in user_issues if i.completed_at]
+                issues = cycle.issues
+                completed_issues = [i for i in issues if i.completed_at]
                 
-                if not completed_issues:
-                    continue
+                total_points = sum(i.estimate or 0 for i in issues)
+                completed_points = sum(i.estimate or 0 for i in completed_issues)
                 
-                points_completed = sum(i.estimate or 0 for i in completed_issues)
+                # Calculate average cycle and lead times
                 cycle_times = []
+                lead_times = []
+                blocked_times = []
                 
                 for issue in completed_issues:
                     if issue.started_at and issue.completed_at:
                         cycle_times.append((issue.completed_at - issue.started_at).total_seconds() / 3600)
+                    if issue.created_at and issue.completed_at:
+                        lead_times.append((issue.completed_at - issue.created_at).total_seconds() / 3600)
+                    
+                    # Calculate total blocked time
+                    blocked_time = sum(
+                        ((b.end_time or datetime.now()) - b.start_time).total_seconds() / 3600
+                        for b in issue.blocked_periods
+                    )
+                    blocked_times.append(blocked_time)
                 
-                # Calculate efficiency ratio (ideal vs actual hours)
-                total_ideal = sum(i.ideal_hours or 0 for i in completed_issues)
-                total_actual = sum(i.actual_hours or 0 for i in completed_issues)
-                efficiency_ratio = total_ideal / total_actual if total_actual else 1.0
-                
-                # Get user capacity for this cycle
-                capacity = next((c for c in cycle.capacities if c.user_id == user.id), None)
-                if capacity:
+                metrics = CycleMetrics(
+                    cycle_id=cycle.id,
+                    total_story_points=total_points,
+                    completed_story_points=completed_points,
+                    avg_cycle_time=sum(cycle_times) / len(cycle_times) if cycle_times else 0,
+                    avg_lead_time=sum(lead_times) / len(lead_times) if lead_times else 0,
+                    throughput=len(completed_issues),
+                    velocity=completed_points,
+                    avg_blocked_time=sum(blocked_times) / len(blocked_times) if blocked_times else 0,
+                    start_date=cycle.start_date,
+                    end_date=cycle.end_date,
+                    team_id=cycle.team_id if hasattr(cycle, 'team_id') else None,
+                    team_name=cycle.team_name if hasattr(cycle, 'team_name') else None,
+                    project_id=None,
+                    project_name=None,
+                    initiative=None
+                )
+                self.db.merge(metrics)
+            self.db.commit()
+        except Exception as e:
+            print(f"Error calculating cycle metrics: {str(e)}")
+            raise
+
+    def _calculate_user_metrics(self):
+        """Calculate comprehensive metrics for each user"""
+        try:
+            users = self.db.query(User).all()
+            cycles = self.db.query(Cycle).all()
+            
+            for user in users:
+                for cycle in cycles:
+                    user_issues = [i for i in cycle.issues if i.assignee_id == user.id]
+                    completed_issues = [i for i in user_issues if i.completed_at]
+                    
+                    if not completed_issues:
+                        continue
+                    
+                    points_completed = sum(i.estimate or 0 for i in completed_issues)
+                    cycle_times = []
+                    
+                    for issue in completed_issues:
+                        if issue.started_at and issue.completed_at:
+                            cycle_times.append((issue.completed_at - issue.started_at).total_seconds() / 3600)
+                    
                     metrics = UserMetrics(
                         user_id=user.id,
                         cycle_id=cycle.id,
                         story_points_completed=points_completed,
                         avg_cycle_time=sum(cycle_times) / len(cycle_times) if cycle_times else 0,
                         velocity=points_completed,
-                        capacity_utilization=points_completed / capacity.capacity_points if capacity.capacity_points else 0,
-                        efficiency_ratio=efficiency_ratio
+                        capacity_utilization=0.0,  # Default since we don't have capacity data
+                        efficiency_ratio=1.0  # Default since we don't have ideal/actual hours
                     )
                     self.db.merge(metrics)
-        self.db.commit()
+            self.db.commit()
+        except Exception as e:
+            print(f"Error calculating user metrics: {str(e)}")
+            raise
 
     def get_cycle_metrics_df(self) -> pd.DataFrame:
         """Return cycle metrics as a pandas DataFrame"""

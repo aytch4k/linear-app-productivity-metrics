@@ -1,0 +1,18 @@
+version: '3.8'
+
+services:
+  linear.app:
+    build: .
+    container_name: linear.app
+    ports:
+      - "8502:8502"
+    volumes:
+      - ./data:/app/data
+    environment:
+      - LINEAR_KEY=${LINEAR_KEY}
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8502"]
+      interval: 30s
+      timeout: 10s
+      retries: 3

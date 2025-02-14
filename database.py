@@ -1,4 +1,4 @@
-from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, ForeignKey, Boolean, Table
+from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, ForeignKey, Boolean, Table, text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
 
@@ -23,6 +23,8 @@ class Cycle(Base):
     end_date = Column(DateTime)
     progress = Column(Float)  # Sprint progress percentage
     max_wip = Column(Integer)  # Maximum Work in Progress limit
+    team_id = Column(String)  # Team ID from Linear
+    team_name = Column(String)  # Team name from Linear
     issues = relationship("Issue", back_populates="cycle")
     capacities = relationship("CycleCapacity", back_populates="cycle")
     daily_metrics = relationship("DailyMetrics", back_populates="cycle")
@@ -147,10 +149,25 @@ class MonteCarloForecast(Base):
     max_completion_date = Column(DateTime)
     expected_completion_date = Column(DateTime)
 
-def init_db(db_path='linear_metrics.db', force_recreate=False):
+def init_db(db_path='data/linear_metrics.db', force_recreate=False):
+    # Ensure data directory exists
+    import os
+    os.makedirs(os.path.dirname(db_path), exist_ok=True)
+    print(f"Using database at: {os.path.abspath(db_path)}")
+    
     engine = create_engine(f'sqlite:///{db_path}')
     if force_recreate:
         Base.metadata.drop_all(engine)
     Base.metadata.create_all(engine)
     Session = sessionmaker(bind=engine)
-    return Session()
+    session = Session()
+    
+    # Test database connection
+    try:
+        session.execute(text('SELECT 1'))
+        print("Database connection successful")
+    except Exception as e:
+        print(f"Database connection failed: {str(e)}")
+        raise
+    
+    return session
