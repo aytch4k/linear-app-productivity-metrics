@@ -71,11 +71,12 @@ cycle_metrics, user_metrics, daily_metrics = get_filtered_data(
 st.title("Linear.app Analytics Dashboard")
 
 # Create tabs for better organization
-tab1, tab2, tab3, tab4 = st.tabs([
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "Sprint Overview",
     "Team Performance",
     "Flow Metrics",
-    "Forecasting"
+    "Forecasting",
+    "Breakdown Analysis"
 ])
 
 with tab1:
@@ -426,6 +427,125 @@ with tab4:
             st.error(f"Error analyzing forecast accuracy: {str(e)}")
     else:
         st.warning("No historical data available for accuracy analysis.")
+
+# Add Breakdown Analysis tab
+with tab5:
+    st.header("Breakdown Analysis")
+    
+    # Add selector for breakdown type
+    breakdown_type = st.selectbox(
+        "Select Breakdown Type",
+        ["Team", "Project", "Initiative"]
+    )
+    
+    if not cycle_metrics.empty:
+        # Get unique values for the selected breakdown type
+        if breakdown_type == "Team":
+            if 'team_name' in cycle_metrics.columns:
+                groups = pd.unique(cycle_metrics['team_name'].dropna())
+                id_field = 'team_id'
+                name_field = 'team_name'
+            else:
+                groups = []
+        elif breakdown_type == "Project":
+            if 'project_name' in cycle_metrics.columns:
+                groups = pd.unique(cycle_metrics['project_name'].dropna())
+                id_field = 'project_id'
+                name_field = 'project_name'
+            else:
+                groups = []
+        else:  # Initiative
+            if 'initiative' in cycle_metrics.columns:
+                groups = pd.unique(cycle_metrics['initiative'].dropna())
+                id_field = 'initiative'
+                name_field = 'initiative'
+            else:
+                groups = []
+        
+        if len(groups) > 0:
+            # Calculate metrics for each group
+            metrics_by_group = []
+            for group in groups:
+                group_issues = cycle_metrics[cycle_metrics[name_field] == group]
+                
+                metrics_by_group.append({
+                    'Group': group,
+                    'Story Points': group_issues['total_story_points'].sum(),
+                    'Velocity': group_issues['velocity'].mean(),
+                    'Throughput': group_issues['throughput'].mean(),
+                    'Avg Lead Time (hours)': group_issues['avg_lead_time'].mean(),
+                    'Avg Cycle Time (hours)': group_issues['avg_cycle_time'].mean()
+                })
+            
+            # Convert to DataFrame
+            metrics_df = pd.DataFrame(metrics_by_group)
+            
+            # Display metrics
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                # Story Points and Velocity
+                fig_points = go.Figure()
+                fig_points.add_trace(go.Bar(
+                    x=metrics_df['Group'],
+                    y=metrics_df['Story Points'],
+                    name='Story Points'
+                ))
+                fig_points.add_trace(go.Bar(
+                    x=metrics_df['Group'],
+                    y=metrics_df['Velocity'],
+                    name='Velocity'
+                ))
+                fig_points.update_layout(
+                    title=f"Story Points and Velocity by {breakdown_type}",
+                    barmode='group',
+                    xaxis_title=breakdown_type,
+                    yaxis_title="Points"
+                )
+                st.plotly_chart(fig_points, use_container_width=True)
+            
+            with col2:
+                # Throughput
+                fig_throughput = go.Figure()
+                fig_throughput.add_trace(go.Bar(
+                    x=metrics_df['Group'],
+                    y=metrics_df['Throughput'],
+                    name='Throughput'
+                ))
+                fig_throughput.update_layout(
+                    title=f"Throughput by {breakdown_type}",
+                    xaxis_title=breakdown_type,
+                    yaxis_title="Issues per Sprint"
+                )
+                st.plotly_chart(fig_throughput, use_container_width=True)
+            
+            # Time Metrics
+            fig_time = go.Figure()
+            fig_time.add_trace(go.Bar(
+                x=metrics_df['Group'],
+                y=metrics_df['Avg Lead Time (hours)'],
+                name='Avg Lead Time'
+            ))
+            fig_time.add_trace(go.Bar(
+                x=metrics_df['Group'],
+                y=metrics_df['Avg Cycle Time (hours)'],
+                name='Avg Cycle Time'
+            ))
+            fig_time.update_layout(
+                title=f"Time Metrics by {breakdown_type}",
+                barmode='group',
+                xaxis_title=breakdown_type,
+                yaxis_title="Hours"
+            )
+            st.plotly_chart(fig_time, use_container_width=True)
+            
+            # Display raw metrics table
+            st.subheader("Raw Metrics")
+            st.dataframe(metrics_df.round(2))
+        else:
+            st.warning(f"No {breakdown_type.lower()} data available.")
+    else:
+        st.warning("No metrics data available yet. Please sync data from Linear first.")
 
 # Add data tables
 with st.expander("View Raw Data"):

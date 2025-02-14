@@ -20,7 +20,7 @@ class LinearMetricsClient:
             'Content-Type': 'application/json',
         }
         self.api_url = 'https://api.linear.app/graphql'
-        self.db = init_db()
+        self.db = init_db(force_recreate=True)
 
     def test_connection(self):
         """Test the API connection with a simple viewer query"""
@@ -108,9 +108,8 @@ class LinearMetricsClient:
                     id
                     cycles(
                         first: 10,
-                        filter: {
-                            startsAt: { gte: "2024-01-01" }
-                        }
+                        last: 5,
+                        orderBy: { startsAt: DESC }
                     ) {
                         nodes {
                             id
@@ -217,6 +216,19 @@ class LinearMetricsClient:
                             assignee {
                                 id
                             }
+                            team {
+                                id
+                                name
+                            }
+                            project {
+                                id
+                                name
+                            }
+                            labels {
+                                nodes {
+                                    name
+                                }
+                            }
                             history(first: 50) {
                                 nodes {
                                     createdAt
@@ -246,6 +258,14 @@ class LinearMetricsClient:
                 page_info = issues_result['data']['team']['issues']['pageInfo']
                 
                 for issue_data in issues:
+                    # Extract initiative from labels (assuming initiative labels start with "Initiative:")
+                    initiative = None
+                    if 'labels' in issue_data and issue_data['labels']['nodes']:
+                        for label in issue_data['labels']['nodes']:
+                            if label['name'].startswith('Initiative:'):
+                                initiative = label['name'].replace('Initiative:', '').strip()
+                                break
+
                     db_issue = Issue(
                         id=issue_data['id'],
                         title=issue_data['title'],
@@ -259,7 +279,12 @@ class LinearMetricsClient:
                         started_at=datetime.fromisoformat(issue_data['startedAt'].replace('Z', '+00:00')) if issue_data['startedAt'] else None,
                         completed_at=datetime.fromisoformat(issue_data['completedAt'].replace('Z', '+00:00')) if issue_data['completedAt'] else None,
                         cycle_id=issue_data['cycle']['id'] if issue_data['cycle'] else None,
-                        assignee_id=issue_data['assignee']['id'] if issue_data['assignee'] else None
+                        assignee_id=issue_data['assignee']['id'] if issue_data['assignee'] else None,
+                        team_id=issue_data['team']['id'] if issue_data['team'] else None,
+                        team_name=issue_data['team']['name'] if issue_data['team'] else None,
+                        project_id=issue_data['project']['id'] if issue_data['project'] else None,
+                        project_name=issue_data['project']['name'] if issue_data['project'] else None,
+                        initiative=initiative
                     )
                     self.db.merge(db_issue)
 
@@ -374,6 +399,26 @@ class LinearMetricsClient:
                 )
                 blocked_times.append(blocked_time)
             
+            # Get most common team/project/initiative info from issues
+            team_counts = {}
+            project_counts = {}
+            initiative_counts = {}
+            
+            for issue in issues:
+                if issue.team_name:
+                    team_counts[issue.team_name] = team_counts.get(issue.team_name, 0) + 1
+                if issue.project_name:
+                    project_counts[issue.project_name] = project_counts.get(issue.project_name, 0) + 1
+                if issue.initiative:
+                    initiative_counts[issue.initiative] = initiative_counts.get(issue.initiative, 0) + 1
+            
+            # Get most common values
+            team_name = max(team_counts.items(), key=lambda x: x[1])[0] if team_counts else None
+            team_id = next((i.team_id for i in issues if i.team_name == team_name), None)
+            project_name = max(project_counts.items(), key=lambda x: x[1])[0] if project_counts else None
+            project_id = next((i.project_id for i in issues if i.project_name == project_name), None)
+            initiative = max(initiative_counts.items(), key=lambda x: x[1])[0] if initiative_counts else None
+            
             metrics = CycleMetrics(
                 cycle_id=cycle.id,
                 total_story_points=total_points,
@@ -384,7 +429,12 @@ class LinearMetricsClient:
                 velocity=completed_points,
                 avg_blocked_time=sum(blocked_times) / len(blocked_times) if blocked_times else 0,
                 start_date=cycle.start_date,
-                end_date=cycle.end_date
+                end_date=cycle.end_date,
+                team_id=team_id,
+                team_name=team_name,
+                project_id=project_id,
+                project_name=project_name,
+                initiative=initiative
             )
             self.db.merge(metrics)
         self.db.commit()
@@ -442,7 +492,12 @@ class LinearMetricsClient:
             'velocity': m.velocity,
             'avg_blocked_time': m.avg_blocked_time,
             'start_date': m.start_date,
-            'end_date': m.end_date
+            'end_date': m.end_date,
+            'team_id': m.team_id,
+            'team_name': m.team_name,
+            'project_id': m.project_id,
+            'project_name': m.project_name,
+            'initiative': m.initiative
         } for m in metrics])
 
     def get_user_metrics_df(self) -> pd.DataFrame:

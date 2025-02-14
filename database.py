@@ -43,6 +43,11 @@ class Issue(Base):
     completed_at = Column(DateTime)
     cycle_id = Column(String, ForeignKey('cycles.id'))
     assignee_id = Column(String, ForeignKey('users.id'))
+    team_id = Column(String)
+    team_name = Column(String)
+    project_id = Column(String)
+    project_name = Column(String)
+    initiative = Column(String)  # Will be derived from labels
     
     cycle = relationship("Cycle", back_populates="issues")
     assignee = relationship("User", back_populates="issues")
@@ -111,6 +116,11 @@ class CycleMetrics(Base):
     avg_blocked_time = Column(Float)  # Average time items spent blocked
     start_date = Column(DateTime)
     end_date = Column(DateTime)
+    team_id = Column(String)
+    team_name = Column(String)
+    project_id = Column(String)
+    project_name = Column(String)
+    initiative = Column(String)
 
 class UserMetrics(Base):
     __tablename__ = 'user_metrics'
@@ -137,8 +147,10 @@ class MonteCarloForecast(Base):
     max_completion_date = Column(DateTime)
     expected_completion_date = Column(DateTime)
 
-def init_db(db_path='linear_metrics.db'):
+def init_db(db_path='linear_metrics.db', force_recreate=False):
     engine = create_engine(f'sqlite:///{db_path}')
+    if force_recreate:
+        Base.metadata.drop_all(engine)
     Base.metadata.create_all(engine)
     Session = sessionmaker(bind=engine)
     return Session()
