@@ -103,20 +103,22 @@ class LinearMetricsClient:
         """Fetch and store cycles (sprints)"""
         teams_query = """
         query {
-            teams(first: 50) {
+            teams(first: 10) {
                 nodes {
                     id
-                    cycles(first: 50) {
+                    cycles(
+                        first: 10,
+                        filter: {
+                            startsAt: { gte: "2024-01-01" }
+                        }
+                    ) {
                         nodes {
                             id
                             number
                             name
                             startsAt
                             endsAt
-                            scopeTarget
-                            progress {
-                                scopeProgress
-                            }
+                            progress
                         }
                     }
                 }
@@ -135,7 +137,7 @@ class LinearMetricsClient:
                     name=cycle_data['name'],
                     start_date=datetime.fromisoformat(cycle_data['startsAt'].replace('Z', '+00:00')),
                     end_date=datetime.fromisoformat(cycle_data['endsAt'].replace('Z', '+00:00')),
-                    target_story_points=cycle_data['scopeTarget'],
+                    progress=cycle_data['progress'],
                     max_wip=5  # Default WIP limit, adjust as needed
                 )
                 self.db.merge(db_cycle)
@@ -187,9 +189,15 @@ class LinearMetricsClient:
         
         for team in teams:
             issues_query = """
-            query($teamId: String!) {
+            query($teamId: String!, $after: String) {
                 team(id: $teamId) {
-                    issues(first: 100) {
+                    issues(
+                        first: 50,
+                        after: $after,
+                        filter: {
+                            createdAt: { gte: "2024-01-01" }
+                        }
+                    ) {
                         nodes {
                             id
                             title
@@ -209,7 +217,7 @@ class LinearMetricsClient:
                             assignee {
                                 id
                             }
-                            history {
+                            history(first: 50) {
                                 nodes {
                                     createdAt
                                     fromState {
@@ -222,77 +230,74 @@ class LinearMetricsClient:
                                     }
                                 }
                             }
-                            customFields {
-                                nodes {
-                                    name
-                                    value
-                                }
-                            }
+                        }
+                        pageInfo {
+                            hasNextPage
+                            endCursor
                         }
                     }
                 }
             }
             """
-            issues_result = self._execute_query(issues_query, {'teamId': team['id']})
-            issues = issues_result['data']['team']['issues']['nodes']
-            
-            for issue_data in issues:
-                # Get ideal hours from custom fields if available
-                ideal_hours = None
-                actual_hours = None
-                for field in issue_data['customFields']['nodes']:
-                    if field['name'] == 'Ideal Hours':
-                        ideal_hours = float(field['value'])
-                    elif field['name'] == 'Actual Hours':
-                        actual_hours = float(field['value'])
+            after = None
+            while True:
+                issues_result = self._execute_query(issues_query, {'teamId': team['id'], 'after': after})
+                issues = issues_result['data']['team']['issues']['nodes']
+                page_info = issues_result['data']['team']['issues']['pageInfo']
+                
+                for issue_data in issues:
+                    db_issue = Issue(
+                        id=issue_data['id'],
+                        title=issue_data['title'],
+                        description=issue_data['description'],
+                        state=issue_data['state']['name'],
+                        priority=issue_data['priority'],
+                        estimate=issue_data['estimate'],
+                        ideal_hours=0.0,  # Default since customFields are not available
+                        actual_hours=0.0,  # Default since customFields are not available
+                        created_at=datetime.fromisoformat(issue_data['createdAt'].replace('Z', '+00:00')),
+                        started_at=datetime.fromisoformat(issue_data['startedAt'].replace('Z', '+00:00')) if issue_data['startedAt'] else None,
+                        completed_at=datetime.fromisoformat(issue_data['completedAt'].replace('Z', '+00:00')) if issue_data['completedAt'] else None,
+                        cycle_id=issue_data['cycle']['id'] if issue_data['cycle'] else None,
+                        assignee_id=issue_data['assignee']['id'] if issue_data['assignee'] else None
+                    )
+                    self.db.merge(db_issue)
 
-                db_issue = Issue(
-                    id=issue_data['id'],
-                    title=issue_data['title'],
-                    description=issue_data['description'],
-                    state=issue_data['state']['name'],
-                    priority=issue_data['priority'],
-                    estimate=issue_data['estimate'],
-                    ideal_hours=ideal_hours,
-                    actual_hours=actual_hours,
-                    created_at=datetime.fromisoformat(issue_data['createdAt'].replace('Z', '+00:00')),
-                    started_at=datetime.fromisoformat(issue_data['startedAt'].replace('Z', '+00:00')) if issue_data['startedAt'] else None,
-                    completed_at=datetime.fromisoformat(issue_data['completedAt'].replace('Z', '+00:00')) if issue_data['completedAt'] else None,
-                    cycle_id=issue_data['cycle']['id'] if issue_data['cycle'] else None,
-                    assignee_id=issue_data['assignee']['id'] if issue_data['assignee'] else None
-                )
-                self.db.merge(db_issue)
-
-                # Store state changes
-                for history in issue_data['history']['nodes']:
-                    if history['fromState'] and history['toState']:
-                        state_change = IssueStateChange(
-                            issue_id=issue_data['id'],
-                            from_state=history['fromState']['name'],
-                            to_state=history['toState']['name'],
-                            changed_at=datetime.fromisoformat(history['createdAt'].replace('Z', '+00:00'))
-                        )
-                        self.db.merge(state_change)
-
-                        # Track blocked periods
-                        if history['toState']['type'] == 'blocked':
-                            blocked_period = BlockedPeriod(
+                    # Store state changes
+                    for history in issue_data['history']['nodes']:
+                        if history['fromState'] and history['toState']:
+                            state_change = IssueStateChange(
                                 issue_id=issue_data['id'],
-                                start_time=datetime.fromisoformat(history['createdAt'].replace('Z', '+00:00')),
-                                reason='External Dependency',  # Default reason
-                                description=f"Blocked in state: {history['toState']['name']}"
+                                from_state=history['fromState']['name'],
+                                to_state=history['toState']['name'],
+                                changed_at=datetime.fromisoformat(history['createdAt'].replace('Z', '+00:00'))
                             )
-                            self.db.merge(blocked_period)
-                        elif history['fromState']['type'] == 'blocked' and history['toState']['type'] != 'blocked':
-                            # Find and update the open blocked period
-                            blocked_period = self.db.query(BlockedPeriod).filter(
-                                BlockedPeriod.issue_id == issue_data['id'],
-                                BlockedPeriod.end_time.is_(None)
-                            ).first()
-                            if blocked_period:
-                                blocked_period.end_time = datetime.fromisoformat(history['createdAt'].replace('Z', '+00:00'))
+                            self.db.merge(state_change)
 
-            self.db.commit()
+                            # Track blocked periods
+                            if history['toState']['type'] == 'blocked':
+                                blocked_period = BlockedPeriod(
+                                    issue_id=issue_data['id'],
+                                    start_time=datetime.fromisoformat(history['createdAt'].replace('Z', '+00:00')),
+                                    reason='External Dependency',  # Default reason
+                                    description=f"Blocked in state: {history['toState']['name']}"
+                                )
+                                self.db.merge(blocked_period)
+                            elif history['fromState']['type'] == 'blocked' and history['toState']['type'] != 'blocked':
+                                # Find and update the open blocked period
+                                blocked_period = self.db.query(BlockedPeriod).filter(
+                                    BlockedPeriod.issue_id == issue_data['id'],
+                                    BlockedPeriod.end_time.is_(None)
+                                ).first()
+                                if blocked_period:
+                                    blocked_period.end_time = datetime.fromisoformat(history['createdAt'].replace('Z', '+00:00'))
+
+                self.db.commit()
+                
+                if not page_info['hasNextPage']:
+                    break
+                    
+                after = page_info['endCursor']
 
     def sync_daily_metrics(self):
         """Calculate and store daily metrics for active cycles"""

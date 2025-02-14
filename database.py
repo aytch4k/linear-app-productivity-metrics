@@ -21,7 +21,7 @@ class Cycle(Base):
     name = Column(String)
     start_date = Column(DateTime)
     end_date = Column(DateTime)
-    target_story_points = Column(Float)  # Planned/targeted story points
+    progress = Column(Float)  # Sprint progress percentage
     max_wip = Column(Integer)  # Maximum Work in Progress limit
     issues = relationship("Issue", back_populates="cycle")
     capacities = relationship("CycleCapacity", back_populates="cycle")

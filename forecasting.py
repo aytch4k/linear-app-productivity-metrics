@@ -23,26 +23,38 @@ class MonteCarloSimulator:
 
     def calculate_completion_distribution(self, cycle_metrics: pd.DataFrame) -> Tuple[float, float]:
         """Calculate mean and std dev of completion rates"""
+        # Filter out NaN, zero, and negative values
         velocities = cycle_metrics['velocity'].dropna()
+        velocities = velocities[velocities > 0]
+        
         if len(velocities) < 2:
-            return 10.0, 2.0  # Default values if not enough data
+            return np.log(10.0), np.log(2.0)  # Default values in log space
         
         # Use log-normal distribution as completion times can't be negative
         log_velocities = np.log(velocities)
-        return log_velocities.mean(), log_velocities.std()
+        mean = log_velocities.mean()
+        std = log_velocities.std()
+        
+        # Handle NaN values
+        if np.isnan(mean) or np.isnan(std):
+            return np.log(10.0), np.log(2.0)  # Default values in log space
+        
+        return mean, std
 
     def simulate_completion_time(
         self,
         story_points: float,
         n_simulations: int = 10000,
+        batch_size: int = 1000,
         confidence_levels: List[float] = [0.5, 0.8, 0.95]
     ) -> Dict:
         """
-        Run Monte Carlo simulation to forecast completion dates
+        Run Monte Carlo simulation to forecast completion dates with batch processing
         
         Args:
             story_points: Total story points to complete
             n_simulations: Number of simulations to run
+            batch_size: Size of each simulation batch
             confidence_levels: Confidence levels to calculate
             
         Returns:
@@ -51,11 +63,19 @@ class MonteCarloSimulator:
         cycle_metrics, _ = self.get_historical_metrics()
         mu, sigma = self.calculate_completion_distribution(cycle_metrics)
         
-        # Generate random completion rates from log-normal distribution
-        completion_rates = np.random.lognormal(mu, sigma, n_simulations)
+        # Initialize arrays for storing results
+        completion_times = np.zeros(n_simulations)
         
-        # Calculate completion times in days
-        completion_times = story_points / completion_rates
+        # Process simulations in batches
+        for i in range(0, n_simulations, batch_size):
+            batch_end = min(i + batch_size, n_simulations)
+            batch_size_actual = batch_end - i
+            
+            # Generate random completion rates for this batch
+            completion_rates = np.random.lognormal(mu, sigma, batch_size_actual)
+            
+            # Calculate completion times for this batch
+            completion_times[i:batch_end] = story_points / completion_rates
         
         # Calculate confidence intervals
         confidence_intervals = {
@@ -63,24 +83,40 @@ class MonteCarloSimulator:
             for level in confidence_levels
         }
         
-        # Calculate expected completion date
-        now = datetime.now()
-        expected_days = np.mean(completion_times)
-        expected_completion = now + timedelta(days=expected_days)
+        # Handle NaN and infinite values
+        completion_times = np.nan_to_num(completion_times, nan=30.0, posinf=365.0, neginf=7.0)
         
-        # Store forecast in database
-        forecast = MonteCarloForecast(
-            simulation_date=now,
-            story_points=story_points,
-            confidence_50=confidence_intervals['confidence_50'],
-            confidence_80=confidence_intervals['confidence_80'],
-            confidence_95=confidence_intervals['confidence_95'],
-            min_completion_date=now + timedelta(days=min(completion_times)),
-            max_completion_date=now + timedelta(days=max(completion_times)),
-            expected_completion_date=expected_completion
-        )
-        self.db.add(forecast)
-        self.db.commit()
+        # Calculate expected completion date with safety checks
+        now = datetime.now()
+        expected_days = float(np.mean(completion_times))
+        if np.isnan(expected_days) or expected_days <= 0:
+            expected_days = 30.0  # Default to 30 days if calculation fails
+        
+        expected_completion = now + timedelta(days=int(expected_days))
+        min_days = float(np.min(completion_times))
+        max_days = float(np.max(completion_times))
+        
+        # Ensure confidence intervals are valid
+        for key in confidence_intervals:
+            if np.isnan(confidence_intervals[key]) or confidence_intervals[key] <= 0:
+                confidence_intervals[key] = expected_days
+        
+        try:
+            # Store forecast in database
+            forecast = MonteCarloForecast(
+                simulation_date=now,
+                story_points=story_points,
+                confidence_50=confidence_intervals['confidence_50'],
+                confidence_80=confidence_intervals['confidence_80'],
+                confidence_95=confidence_intervals['confidence_95'],
+                min_completion_date=now + timedelta(days=int(min_days)),
+                max_completion_date=now + timedelta(days=int(max_days)),
+                expected_completion_date=expected_completion
+            )
+            self.db.add(forecast)
+            self.db.commit()
+        except Exception as e:
+            print(f"Failed to store forecast: {str(e)}")
         
         return {
             'story_points': story_points,

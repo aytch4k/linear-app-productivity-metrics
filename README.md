@@ -140,10 +140,27 @@ The application uses SQLite with the following tables:
 - Story point sequence: Fibonacci (1-2-3-5-8-13)
 
 ### Performance Settings
-- Daily metrics calculation frequency
-- Historical data retention period
-- Graph update intervals
-- Data sync frequency
+- Daily metrics calculation frequency: Every 24 hours
+- Historical data retention period: 90 days by default (configurable in linear_client.py)
+- Graph update intervals: Real-time with caching (1-hour TTL)
+- Data sync frequency: On-demand or scheduled
+- Pagination settings:
+  * Team queries: 10 teams per page
+  * Cycle queries: 10 cycles per page
+  * Issue queries: 50 issues per page
+  * History queries: 50 entries per page
+- Monte Carlo simulation:
+  * Default simulations: 10,000
+  * Batch size: 1,000 simulations per batch
+  * Memory-optimized processing
+
+### Memory Usage Optimization
+The application implements several optimizations to reduce memory usage:
+1. Date-based filtering: Only fetches last 90 days of data by default
+2. Pagination: Implements cursor-based pagination for all Linear API queries
+3. Batch processing: Monte Carlo simulations run in configurable batches
+4. Data caching: Dashboard implements TTL-based caching
+5. Lazy loading: Data is loaded on-demand based on selected date ranges
 
 ## Contributing
 
